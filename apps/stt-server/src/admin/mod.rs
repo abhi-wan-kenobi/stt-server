@@ -1,0 +1,1 @@
+//! Admin route handlers. TODO(port): migrate from notare/apps/stt-server/src/admin/.

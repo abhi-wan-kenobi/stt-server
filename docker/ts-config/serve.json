@@ -1,0 +1,16 @@
+{
+  "TCP": {
+    "443": {
+      "HTTPS": true
+    }
+  },
+  "Web": {
+    "https://stt.${TAILNET_NAME}.ts.net": {
+      "Handlers": {
+        "/": {
+          "Proxy": "http://127.0.0.1:8383"
+        }
+      }
+    }
+  }
+}

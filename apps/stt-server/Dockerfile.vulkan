@@ -1,0 +1,39 @@
+# stt-server — Vulkan GPU image (AMD / Intel / NVIDIA-via-Vulkan).
+#
+# This is the AMD production path (the ROCm experiment was reverted — see
+# docs/architecture.md §"Why Vulkan, not ROCm"). transcribe.cpp's ggml Vulkan
+# backend covers AMD RDNA2/3, Intel Arc, and NVIDIA via Vulkan.
+#
+#   docker build -f apps/stt-server/Dockerfile.vulkan -t stt-server:vulkan .
+#   docker run --rm -p 8383:8383 --device /dev/dri --group-add video \
+#     -v stt-models:/data/models stt-server:vulkan
+#
+# RDNA2 (RX 6600 etc.): if silent CPU fallback is detected, the admin panel
+# surfaces a `CPU Fallback` state. Run with STT_REQUIRE_GPU=true to fail
+# startup if Vulkan isn't working.
+
+FROM rust:1.95-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake clang libclang-dev pkg-config libssl-dev ca-certificates \
+    libvulkan-dev glslc \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /workspace
+COPY . .
+RUN cargo build --release -p stt-server --features vulkan && \
+    cp target/release/stt-server /usr/local/bin/stt-server
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 curl libvulkan1 mesa-vulkan-drivers vulkan-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --create-home --uid 10001 stt
+COPY --from=builder /usr/local/bin/stt-server /usr/local/bin/stt-server
+RUN mkdir -p /data/models && chown -R stt:stt /data
+VOLUME ["/data"]
+USER stt
+ENV STT_HOST=0.0.0.0 STT_PORT=8383 STT_MODEL_DIR=/data/models \
+    STT_REQUIRE_GPU=true RUST_LOG=info
+EXPOSE 8383
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
+    CMD curl -f "http://localhost:${STT_PORT}/health" || exit 1
+ENTRYPOINT ["/usr/local/bin/stt-server"]

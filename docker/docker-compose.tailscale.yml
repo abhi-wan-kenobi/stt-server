@@ -1,0 +1,70 @@
+# stt-server + Tailscale sidecar — reference deploy.
+#
+# The server binds 0.0.0.0:8383 inside the shared network namespace of the
+# Tailscale sidecar; Tailscale Serve terminates HTTPS on the tailnet name and
+# proxies to it. Result: https://<hostname>.<tailnet>.ts.net reachable from
+# any tailnet device with a real ts.net cert — which also satisfies clients
+# that require HTTPS/wss on non-loopback custom servers. Tailnet-only (Serve,
+# NOT Funnel = never public internet) unless you flip Funnel on from the
+# landing page toggle.
+#
+# Secrets come from ./.env (git-ignored): TS_AUTHKEY, STT_TOKEN.
+#   docker compose -f docker/docker-compose.tailscale.yml up -d
+#
+# Pick the image variant that matches your GPU:
+#   AMD / Intel / NVIDIA-via-Vulkan  → stt-server:vulkan  (default below)
+#   NVIDIA CUDA                       → stt-server:cuda
+#   CPU only                          → stt-server:cpu
+
+services:
+  stt-tailscale:
+    image: tailscale/tailscale:latest
+    container_name: stt-tailscale
+    hostname: ${TS_HOSTNAME:-stt}
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY}
+      TS_HOSTNAME: ${TS_HOSTNAME:-stt}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "false"
+      TS_SERVE_CONFIG: /ts-config/serve.json
+      TS_EXTRA_ARGS: --advertise-tags=tag:stt-server
+    volumes:
+      - ./ts-state:/var/lib/tailscale
+      - ./ts-config:/ts-config:ro
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+
+  stt-server:
+    image: ghcr.io/abhi-wan-kenobi/stt-server:vulkan
+    container_name: stt-server
+    network_mode: service:stt-tailscale
+    depends_on:
+      - stt-tailscale
+    environment:
+      STT_HOST: 0.0.0.0
+      STT_PORT: "8383"
+      STT_MODEL_DIR: /models
+      STT_MODEL: whisper-large-v3-turbo-q5_0
+      STT_REQUIRE_GPU: "true"
+      STT_HEALTH_MIN_RTF: "2.0"
+      STT_HEALTH_INTERVAL_SECS: "300"
+      STT_HEALTH_FAIL_STREAK: "2"
+      STT_HEALTH_AUTORESTART: "true"
+      STT_TOKEN: ${STT_TOKEN}
+    volumes:
+      - ${STT_MODEL_HOST_DIR:-/home/skywalker/stt-models}:/models
+      - stt-data:/data
+    # AMD Vulkan — expose the render + video devices. NVIDIA CUDA uses --gpus all instead.
+    devices:
+      - /dev/dri/card0:/dev/dri/card0
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    group_add:
+      - "993"  # render
+      - "44"   # video
+    restart: unless-stopped
+
+volumes:
+  stt-data:

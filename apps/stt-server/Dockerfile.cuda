@@ -1,0 +1,32 @@
+# stt-server — NVIDIA CUDA image.
+#
+#   docker build -f apps/stt-server/Dockerfile.cuda -t stt-server:cuda .
+#   docker run --rm -p 8383:8383 --gpus all \
+#     -v stt-models:/data/models stt-server:cuda
+#
+# Requires the NVIDIA Container Toolkit.
+
+FROM rust:1.95-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake clang libclang-dev pkg-config libssl-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /workspace
+COPY . .
+RUN cargo build --release -p stt-server --features cuda && \
+    cp target/release/stt-server /usr/local/bin/stt-server
+
+FROM nvidia/cuda:12.6.2-cudnn-runtime-bookworm AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --create-home --uid 10001 stt
+COPY --from=builder /usr/local/bin/stt-server /usr/local/bin/stt-server
+RUN mkdir -p /data/models && chown -R stt:stt /data
+VOLUME ["/data"]
+USER stt
+ENV STT_HOST=0.0.0.0 STT_PORT=8383 STT_MODEL_DIR=/data/models \
+    STT_REQUIRE_GPU=true RUST_LOG=info
+EXPOSE 8383
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
+    CMD curl -f "http://localhost:${STT_PORT}/health" || exit 1
+ENTRYPOINT ["/usr/local/bin/stt-server"]

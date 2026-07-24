@@ -1,0 +1,12 @@
+/target
+**/target
+Cargo.lock
+node_modules
+dist
+*.swp
+.DS_Store
+.env
+.env.*
+!.env.example
+data/
+ts-state/
