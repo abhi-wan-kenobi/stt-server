@@ -5,8 +5,12 @@
 #     -v stt-models:/data/models stt-server:cuda
 #
 # Requires the NVIDIA Container Toolkit.
+#
+# NOTE: ubuntu24.04 renamed libasound2 -> libasound2t64 (t64 ABI transition),
+# which broke the runtime apt-get. ubuntu22.04 has the old package names, so
+# both builder + runtime use ubuntu22.04 (glibc 2.35, consistent).
 
-FROM nvidia/cuda:12.6.2-devel-ubuntu24.04 AS builder
+FROM nvidia/cuda:12.6.2-devel-ubuntu22.04 AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake clang libclang-dev pkg-config libssl-dev ca-certificates curl \
     libasound2-dev libudev-dev libpulse-dev libpipewire-0.3-dev \
@@ -19,7 +23,7 @@ COPY . .
 RUN cargo build --release -p stt-server --features cuda && \
     cp target/release/stt-server /usr/local/bin/stt-server
 
-FROM nvidia/cuda:12.6.2-runtime-ubuntu24.04 AS runtime
+FROM nvidia/cuda:12.6.2-runtime-ubuntu22.04 AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 curl \
     libasound2 libudev1 libpulse0 libpipewire-0.3-0 \

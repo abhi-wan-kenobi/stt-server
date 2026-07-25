@@ -11,12 +11,22 @@
 # RDNA2 (RX 6600 etc.): if silent CPU fallback is detected, the admin panel
 # surfaces a `CPU Fallback` state. Run with STT_REQUIRE_GPU=true to fail
 # startup if Vulkan isn't working.
+#
+# NOTE: whisper-rs rev 129b982 uses vk::LayerSettingsCreateInfoEXT (Vulkan-Hpp
+# 1.3.296+). Debian bookworm's libvulkan-dev is older, so we install the
+# LunarG Vulkan SDK 1.3.296 bookworm repo for the newer headers.
 
 FROM rust:1.95-bookworm AS builder
+
+# LunarG Vulkan SDK 1.3.296 repo (provides Vulkan-Hpp 1.3.296+ headers + libs).
+RUN wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | gpg --dearmor -o /usr/share/keyrings/lunarg-signing-key-pub.gpg && \
+    wget -qO /etc/apt/sources.list.d/lunarg-vulkan-1.3.296-bookworm.list \
+           https://packages.lunarg.com/vulkan/1.3.296/lunarg-vulkan-1.3.296-bookworm.list
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake clang libclang-dev pkg-config libssl-dev ca-certificates \
     libasound2-dev libudev-dev libpulse-dev libpipewire-0.3-dev \
-    libvulkan-dev glslc glslang-tools \
+    vulkan-sdk glslc glslang-tools \
     && rm -rf /var/lib/apt/lists/*
 RUN rustup component add rustfmt
 WORKDIR /workspace
