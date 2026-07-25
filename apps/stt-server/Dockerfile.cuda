@@ -9,6 +9,10 @@
 FROM rust:1.95-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake clang libclang-dev pkg-config libssl-dev ca-certificates \
+    libasound2-dev \
+    libudev-dev \
+    libpulse-dev \
+    libpipewire-0.3-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /workspace
 COPY . .
@@ -18,6 +22,10 @@ RUN cargo build --release -p stt-server --features cuda && \
 FROM nvidia/cuda:12.6.2-runtime-bookworm AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 curl \
+    libasound2-dev \
+    libudev-dev \
+    libpulse-dev \
+    libpipewire-0.3-dev \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --uid 10001 stt
 COPY --from=builder /usr/local/bin/stt-server /usr/local/bin/stt-server
