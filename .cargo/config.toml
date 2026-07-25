@@ -1,0 +1,6 @@
+# Use the system `git` CLI for fetching git dependencies. Cargo's built-in
+# libgit2 fetcher fails (exit 101) on transient 503s from git hosts like
+# codeberg.org; the CLI git has better retry + resume logic. Needed so GHCR
+# builds survive codeberg 503 blips (saw run 7 fail this way on cpu + cuda).
+[net]
+git-fetch-with-cli = true
