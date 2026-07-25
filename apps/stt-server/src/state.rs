@@ -1,14 +1,251 @@
-use crate::config::Config;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
 
-pub struct AppState {
-    pub cfg: Config,
+use hypr_local_model::{LocalModel, WhisperModel};
+use hypr_model_downloader::{
+    DownloadStatus, ModelDownloadManager, ModelDownloaderRuntime, ModelIntegrity,
+};
+use hypr_transcribe_whisper_local::TranscribeService;
+use tokio::sync::RwLock;
+
+use crate::admin::models::CATALOG;
+use crate::config::Config;
+
+/// Runtime glue between `hypr_model_downloader::ModelDownloadManager` and
+/// this server. Models live at `<model_dir>/stt/<file>` (the same layout the
+/// desktop uses via `LocalModel::install_path`); download progress is kept
+/// in an in-memory map rather than pushed anywhere, because a plain HTTP/JSON
+/// server has no Tauri-event-style push channel — `GET /api/models` and
+/// `GET /api/models/{id}/progress` poll it instead (see
+/// `docs/stt-server-design.md`, Phase 2 addendum, for the rationale).
+struct ServerModelRuntime {
+    model_dir: PathBuf,
+    progress: Arc<StdMutex<HashMap<String, DownloadStatus>>>,
 }
 
-impl AppState {
-    pub async fn new(cfg: Config) -> anyhow::Result<Self> {
-        Ok(Self { cfg })
+impl ModelDownloaderRuntime<LocalModel> for ServerModelRuntime {
+    fn models_base(&self) -> Result<PathBuf, hypr_model_downloader::Error> {
+        Ok(self.model_dir.clone())
+    }
+
+    fn emit_progress(&self, model: &LocalModel, status: DownloadStatus) {
+        // Only whisper models are ever downloaded through this server's
+        // catalog (see `CATALOG`), but match exhaustively-by-variant rather
+        // than assuming, in case that ever changes.
+        if let LocalModel::Whisper(model) = model {
+            self.progress
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(model.to_string(), status);
+        }
     }
 }
 
-pub type SharedState = Arc<AppState>;
+/// The currently-serving core: which catalog model id is active, and the
+/// already-(re)built `TranscribeService` that `/v1/listen` dispatches to.
+/// `POST /api/models/{id}/activate` swaps both fields atomically under one
+/// write lock. The previous `TranscribeService` — and the
+/// `hypr_model_manager::ModelManager` (+ loaded whisper context) it owns
+/// internally — drops once no in-flight request still holds a clone of it,
+/// which is how "unload" happens: there is no separate unload call to make,
+/// Rust's ownership does it (see `docs/stt-server-design.md` Phase 2
+/// addendum for why a fresh `TranscribeService` per activation, not a
+/// server-wide `ModelManager<LoadedWhisper>`, is the swap unit here).
+pub(crate) struct ActiveService {
+    pub(crate) model: WhisperModel,
+    pub(crate) core: TranscribeService,
+}
+
+/// Shared state for the `/api/*` admin handlers and the dynamic `/v1/listen`
+/// dispatcher (`router::DynamicListen`).
+pub struct AppState {
+    pub config: Config,
+    pub start_time: Instant,
+    pub(crate) downloader: ModelDownloadManager<LocalModel>,
+    pub(crate) progress: Arc<StdMutex<HashMap<String, DownloadStatus>>>,
+    pub(crate) active: RwLock<ActiveService>,
+    pub(crate) probe_result: RwLock<Option<f32>>,
+    /// Latest periodic health-monitor probe realtime factor (`None` until the
+    /// first periodic tick completes, or if the latest probe could not run).
+    /// Distinct from `probe_result` (the one-shot startup probe) so `/api/status`
+    /// can show both. See `src/health.rs`.
+    pub(crate) periodic_probe_result: RwLock<Option<f32>>,
+    /// Health flag the periodic monitor flips to `false` on sustained RTF
+    /// degradation; `GET /health` returns 503 while this is false. Defaults
+    /// true. Latches: an operator restart clears it (with autorestart on the
+    /// process exits to force that; with it off `/health` stays 503).
+    healthy: AtomicBool,
+    /// Consecutive low/failed periodic-probe count, driven by
+    /// `health::update_streak`. Single-writer (the one monitor task) +
+    /// multiple readers (`/health`, `/api/status`), hence the atomic.
+    low_streak: AtomicU32,
+}
+
+/// `POST /api/models/{id}/activate` failure modes, mapped to HTTP status by
+/// `admin::models::activate_model`.
+#[derive(Debug)]
+pub(crate) enum ActivateError {
+    NotInstalled,
+    Corrupt(String),
+    IntegrityCheckFailed(String),
+}
+
+impl AppState {
+    pub fn new(config: Config) -> Self {
+        let progress = Arc::new(StdMutex::new(HashMap::new()));
+        let runtime = Arc::new(ServerModelRuntime {
+            model_dir: config.model_dir.clone(),
+            progress: progress.clone(),
+        });
+        let downloader = ModelDownloadManager::new(runtime);
+
+        // Identical to Phase 1's `router::build_router` at startup: one
+        // `TranscribeService` built for the configured default model, warmed
+        // up in the background by its builder.
+        let core = TranscribeService::builder()
+            .model_path(config.model_path())
+            .build();
+
+        Self {
+            active: RwLock::new(ActiveService {
+                model: config.model.clone(),
+                core,
+            }),
+            downloader,
+            progress,
+            probe_result: RwLock::new(None),
+            periodic_probe_result: RwLock::new(None),
+            healthy: AtomicBool::new(true),
+            low_streak: AtomicU32::new(0),
+            start_time: Instant::now(),
+            config,
+        }
+    }
+
+    /// Runs the timed GPU offload verification probe on a blocking thread
+    /// and caches the calculated realtime factor in `AppState::probe_result`.
+    pub async fn run_probe_for_model(&self, model: WhisperModel) {
+        let model_path = self.model_path_for(&model);
+        if !model_path.is_file() {
+            tracing::warn!(
+                model = %model,
+                path = %model_path.display(),
+                "probe: model file not found; skipping probe"
+            );
+            return;
+        }
+
+        tracing::info!(
+            model = %model,
+            path = %model_path.display(),
+            "probe: starting GPU offload verification inference"
+        );
+
+        let port = self.config.port;
+        let result = crate::probe::run_probe(port, self.config.token.as_deref()).await;
+
+        match result {
+            Some(factor) => {
+                tracing::info!(
+                    model = %model,
+                    realtime_factor = factor,
+                    "probe: GPU offload verification inference completed"
+                );
+                let mut guard = self.probe_result.write().await;
+                *guard = Some(factor);
+            }
+            None => {
+                tracing::warn!(
+                    model = %model,
+                    "probe: GPU offload verification inference returned no factor"
+                );
+            }
+        }
+    }
+
+    /// `<model_dir>/stt/<file name>` for any catalog model, matching
+    /// `Config::model_path` for the configured default.
+    pub(crate) fn model_path_for(&self, model: &WhisperModel) -> PathBuf {
+        LocalModel::Whisper(model.clone()).install_path(&self.config.model_dir)
+    }
+
+    /// Whether the periodic health monitor has flipped the service unhealthy
+    /// (sustained RTF degradation). `GET /health` returns 503 while false.
+    pub fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Relaxed)
+    }
+
+    /// Latch the service unhealthy (503). Only the periodic monitor calls this.
+    pub(crate) fn set_unhealthy(&self) {
+        self.healthy.store(false, Ordering::Relaxed);
+    }
+
+    /// Current consecutive-low/failed periodic-probe count (for `/api/status`
+    /// diagnostics and the monitor's own hysteresis).
+    pub(crate) fn low_streak(&self) -> u32 {
+        self.low_streak.load(Ordering::Relaxed)
+    }
+
+    /// Set the consecutive-low streak (monitor only writer).
+    pub(crate) fn set_low_streak(&self, value: u32) {
+        self.low_streak.store(value, Ordering::Relaxed);
+    }
+
+    /// `POST /api/models/{id}/activate`: verify the model is installed
+    /// (`Verified` or `PresentUnverified`) via
+    /// `hypr_model_downloader::verify_model`, then rebuild the `/v1/listen`
+    /// core against it — `TranscribeService::builder().build()` registers it
+    /// with a fresh `hypr_model_manager::ModelManager` and kicks off the same
+    /// background warmup load Phase 1 already relies on at startup, so
+    /// "activate" both loads (eagerly, via warmup) and satisfies "lazy load
+    /// on first request" (`ModelManager::get` loads on demand if the warmup
+    /// hasn't finished or the model was since evicted for inactivity).
+    pub(crate) async fn activate(
+        &self,
+        model: WhisperModel,
+    ) -> Result<ModelIntegrity, ActivateError> {
+        let local = LocalModel::Whisper(model.clone());
+        let integrity = self
+            .downloader
+            .verify_integrity(&local)
+            .await
+            .map_err(|e| ActivateError::IntegrityCheckFailed(e.to_string()))?;
+
+        match &integrity {
+            ModelIntegrity::Verified | ModelIntegrity::PresentUnverified => {}
+            ModelIntegrity::NotInstalled => return Err(ActivateError::NotInstalled),
+            ModelIntegrity::Corrupt(reason) => return Err(ActivateError::Corrupt(reason.clone())),
+        }
+
+        let core = TranscribeService::builder()
+            .model_path(self.model_path_for(&model))
+            .build();
+
+        // Clear the probe result before swap
+        let mut probe_guard = self.probe_result.write().await;
+        *probe_guard = None;
+        drop(probe_guard);
+
+        let mut guard = self.active.write().await;
+        guard.core = core;
+        guard.model = model;
+        drop(guard);
+
+        Ok(integrity)
+    }
+
+    /// Startup reconciliation (design doc §8): verify every catalog model's
+    /// on-disk reality (existence + size + CRC32) and quarantine anything
+    /// corrupt to `*.corrupt`, exactly like the desktop's plugin `setup()`
+    /// hook (`plugins/local-stt/src/lib.rs`) — reused verbatim via
+    /// `ModelDownloadManager::reconcile`, not reimplemented. Call once from
+    /// `main` before serving.
+    pub async fn reconcile_on_startup(&self) {
+        let models: Vec<LocalModel> = CATALOG.iter().cloned().map(LocalModel::Whisper).collect();
+        let results = self.downloader.reconcile(&models).await;
+        tracing::info!(checked = results.len(), "stt_server_model_reconcile_done");
+    }
+}

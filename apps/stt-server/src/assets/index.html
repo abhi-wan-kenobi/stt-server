@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="color-scheme" content="dark" />
-<title>Notare STT Server</title>
+<title>STT Server</title>
 <style>
   /* ------------------------------------------------------------------ */
   /* Tokens — docs/DESIGN-DIRECTION.md §2 "cobalt on graphite" (dark-    */
@@ -404,7 +404,7 @@
     <header class="topbar">
       <div class="brand">
         <span class="brand-dot" id="healthDot" title="Server reachability"></span>
-        <span class="brand-name">Notare</span>
+        <span class="brand-name">stt-server</span>
         <span class="brand-sub">STT Server</span>
       </div>
       <div class="topbar-meta">
@@ -464,14 +464,34 @@
           </table>
         </div>
       </section>
+
+      <section class="panel" aria-labelledby="expose-title">
+        <div class="panel-header-row">
+          <h2 class="panel-title" id="expose-title">Expose over Tailscale</h2>
+          <span class="panel-hint" id="exposeState">Loading…</span>
+        </div>
+        <p class="panel-hint" id="exposeUrl" style="font-family: monospace; word-break: break-all;"></p>
+        <form id="exposeForm" style="display: grid; gap: 8px; margin-top: 8px;">
+          <label>Auth key <input type="password" name="ts_authkey" placeholder="tskey-auth-…" required autocomplete="off"></label>
+          <label>Hostname <input type="text" name="hostname" placeholder="stt" required autocomplete="off"></label>
+          <label style="display: flex; align-items: center; gap: 6px;">
+            <input type="checkbox" name="funnel"> Funnel (public internet — off = tailnet-only Serve, the safe default)
+          </label>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <button type="submit">Save + show URL</button>
+            <span class="panel-hint">then run: docker compose -f docker/docker-compose.tailscale.yml up -d</span>
+          </div>
+        </form>
+        <p class="panel-hint" style="margin-top: 8px;">POST /api/tailscale is bearer-token-gated. The server writes <code>TS_AUTHKEY</code> + <code>TS_HOSTNAME</code> to <code>docker/.env</code>; you apply them with docker compose.</p>
+      </section>
     </main>
 
     <footer class="footer">
-      <span>Notare STT companion server</span>
+      <span>STT server</span>
       <span class="footer-sep">·</span>
       <a href="/api/status" target="_blank" rel="noopener">/api/status</a>
       <span class="footer-sep">·</span>
-      <a href="https://github.com/abhi-wan-kenobi/notare" target="_blank" rel="noopener">source</a>
+      <a href="https://github.com/abhi-wan-kenobi/stt-server" target="_blank" rel="noopener">source</a>
     </footer>
   </div>
 
@@ -880,7 +900,44 @@
     }
 
     refresh();
-  })();
+  
+    // ===== Tailscale expose card =====
+    const exposeForm = document.getElementById('exposeForm');
+    const exposeState = document.getElementById('exposeState');
+    const exposeUrl = document.getElementById('exposeUrl');
+    function bearerToken() {
+      return localStorage.getItem('stt_token') || '';
+    }
+    async function refreshExpose() {
+      try {
+        const r = await fetch('/api/tailscale', { headers: bearerToken() ? { Authorization: 'Bearer ' + bearerToken() } : {} });
+        const j = await r.json();
+        exposeState.textContent = j.exposed ? (j.funnel ? 'Funnel (public)' : 'Serve (tailnet)') : 'Not exposed';
+        exposeUrl.textContent = j.url || '';
+      } catch (e) { exposeState.textContent = 'error'; }
+    }
+    exposeForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fd = new FormData(exposeForm);
+      const body = { ts_authkey: fd.get('ts_authkey'), hostname: fd.get('hostname'), funnel: fd.get('funnel') === 'on' };
+      const r = await fetch('/api/tailscale', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(bearerToken() ? { Authorization: 'Bearer ' + bearerToken() } : {}) },
+        body: JSON.stringify(body),
+      });
+      const j = await r.json();
+      if (r.ok) {
+        exposeState.textContent = j.funnel ? 'Funnel (public) — saved' : 'Serve (tailnet) — saved';
+        exposeUrl.textContent = j.url || '';
+        exposeForm.querySelector('input[name=ts_authkey]').value = '';
+      } else {
+        exposeState.textContent = 'error: ' + (j.detail || r.status);
+      }
+    });
+    refreshExpose();
+    setInterval(refreshExpose, 5000);
+
+})();
   </script>
 </body>
 </html>
